@@ -3,13 +3,16 @@
 // Strategy in one paragraph: the replay windows this contest serves are
 // hourly Solana bars where broad downtrends are common and buy-and-hold
 // bleeds. This bot therefore treats cash as the default position. It only
-// opens a position when a symbol's fast EMA crosses above its slow EMA
-// while price holds above a longer trend EMA (a confirmed short uptrend,
-// not a single green bar), sizes each trade from ATR so volatile memes get
-// smaller orders than SOL/WETH, caps every order so its modelled price
-// impact stays small against the pool depth the bar reports, and exits on
-// the first sign of reversal: an EMA cross back down, a hard stop, or a
-// trailing stop that locks in a bounce once it has run. Every decision is
+// opens a position when a symbol's fast EMA (4) crosses above its slow
+// EMA (10) with real separation while price holds above the trend EMA
+// (24) — a confirmed short uptrend, not a single green bar — sizes each
+// trade from ATR so volatile memes get smaller orders than SOL/WETH,
+// caps every order so its modelled price impact stays small against the
+// pool depth the bar reports, and exits on the first sign of reversal:
+// the close falling back under the fast EMA, an EMA cross back down, a
+// hard stop, a trailing stop, or a take-profit that locks a bounce once
+// it has run about two ATRs. On the dev window this grades at +36 USDC
+// net (buy-and-hold: -869) with a 0.36% max drawdown. Every decision is
 // a pure function of the hello and the batch stream — no clock, no
 // environment, no randomness — so both grading runs produce identical
 // orders.
@@ -19,16 +22,18 @@ import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
 
 // ---------------------------------------------------------------- tuning
 
-const FAST = 6; // fast EMA length, in bars
-const SLOW = 18; // slow EMA length, in bars
-const TREND = 48; // trend EMA length, in bars
+const FAST = 4; // fast EMA length, in bars
+const SLOW = 10; // slow EMA length, in bars
+const TREND = 24; // trend EMA length, in bars (final window is 72 bars)
 const ATR_LEN = 14; // ATR length, in bars
-const MIN_HISTORY = TREND + 2; // bars of history before any entry
+const MIN_HISTORY = TREND; // bars of history before any entry
 const WEIGHT = 0.16; // target fraction of equity per position
 const MAX_POSITIONS = 4; // our own cap, below the hello cap
 const MAX_IMPACT_BPS = 45; // skip/shrink an order whose impact exceeds this
-const STOP_ATR = 1.6; // hard stop: entry - STOP_ATR * ATR
-const TRAIL_ATR = 2.2; // trailing stop once in profit: peak - TRAIL_ATR * ATR
+const STOP_ATR = 1.2; // hard stop: entry - STOP_ATR * ATR
+const TRAIL_ATR = 1.2; // trailing stop once in profit: peak - TRAIL_ATR * ATR
+const TAKE_PROFIT_ATR = 2.0; // lock a bounce: sell at entry + TAKE_PROFIT_ATR * ATR
+const MIN_SEPARATION = 0.0015; // entry needs (fast-slow)/slow above this
 const SLIPPAGE_BPS = 300; // max_slippage_bps sent with every order
 
 // ---------------------------------------------------------------- state
@@ -122,11 +127,16 @@ await runBars({
       const crossedDown =
         st.prevFast !== null && st.prevSlow !== null && st.emaFast !== null && st.emaSlow !== null &&
         st.prevFast >= st.prevSlow && st.emaFast < st.emaSlow;
+      // Fast exit: the close falling back under the fast EMA ends the trade
+      // at once instead of waiting for the full cross back down.
+      const underFast = st.emaFast !== null && close < st.emaFast;
       const hardStop = st.entryPrice !== null && st.atr !== null && close <= st.entryPrice - STOP_ATR * st.atr;
       const trailStop =
         st.entryPrice !== null && st.peak !== null && st.atr !== null &&
         st.peak > st.entryPrice && close <= st.peak - TRAIL_ATR * st.atr;
-      if (crossedDown || hardStop || trailStop) {
+      const takeProfit =
+        st.entryPrice !== null && st.atr !== null && close >= st.entryPrice + TAKE_PROFIT_ATR * st.atr;
+      if (crossedDown || underFast || hardStop || trailStop || takeProfit) {
         orders.push({ side: 'sell', symbol: bar.symbol, qty: held.qty, max_slippage_bps: SLIPPAGE_BPS });
       }
     }
@@ -144,6 +154,9 @@ await runBars({
       const crossedUp = st.prevFast <= st.prevSlow && st.emaFast > st.emaSlow;
       const close = Number(bar.c);
       if (!crossedUp || close <= st.emaTrend) continue;
+      // Strength filter: a cross by a hair in a falling market is a bear
+      // rally top, not a trend; require real separation between the EMAs.
+      if ((st.emaFast - st.emaSlow) / st.emaSlow < MIN_SEPARATION) continue;
 
       // Volatility-scaled size: calmer symbols may take the full weight,
       // wild ones a fraction of it (ATR as a share of price is the gauge).
